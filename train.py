@@ -1,164 +1,172 @@
+import argparse
+import os
+import time
+import uuid
+from collections import deque
+from typing import Optional
+
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import torch.backends.cudnn as cudnn
-import torch.utils.data as data
+from tensorboardX import SummaryWriter
+from torch import optim
+from torch.utils.data import DataLoader
 
-import os
-import sys
-import time
-import argparse
-import numpy as np
+from backbone.base import Base as BackboneBase
+from config.train_config import TrainConfig as Config
+from dataset.base import Base as DatasetBase
+from extension.lr_scheduler import WarmUpMultiStepLR
+from logger import Logger as Log
+from model import Model
+from roi.pooler import Pooler
 
-try:
-    import cv2
-except ImportError:
-    sys.path.remove('/opt/ros/kinetic/lib/python2.7/dist-packages')
-    import cv2
 
-from cfg import voc_mean
-from cfg import voc_root
-from cfg import voc_classes
-from cfg import ssd_cfg
-from data.augmentations import Augmentation
-from data.voc import VOCDataset
-from data.voc import VOCTransform
-from utils.utils import collate
-from utils.utils import adjust_lr
-from layers.ssd import build_ssd
-from layers.multi_box_loss import MultiBoxLoss
+def _train(dataset_name: str, backbone_name: str, path_to_data_dir: str, path_to_checkpoints_dir: str, path_to_resuming_checkpoint: Optional[str]):
+    dataset = DatasetBase.from_name(dataset_name)(path_to_data_dir, DatasetBase.Mode.TRAIN, Config.IMAGE_MIN_SIDE, Config.IMAGE_MAX_SIDE)
+    dataloader = DataLoader(dataset, batch_size=Config.BATCH_SIZE,
+                            sampler=DatasetBase.NearestRatioRandomSampler(dataset.image_ratios, num_neighbors=Config.BATCH_SIZE),
+                            num_workers=8, collate_fn=DatasetBase.padding_collate_fn, pin_memory=True)
 
-def str2bool(v):
-    return v.lower() in ('yes', 'true', 't', '1')
-    
-parser = argparse.ArgumentParser(description='SSD Training')
-parser.add_argument('--dataset_root', default=voc_root, type=str,
-    help='dataset root directory path')
-parser.add_argument('--dataset_year', default='2012', type=str,
-    help='year of dataset')
-parser.add_argument('--dataset_style', default='trainval', type=str,
-    help='style of dataset')
-parser.add_argument('--resume', default=None, type=str,
-    help='file path of model to resume training')
-parser.add_argument('--pretrained_model', default='weights/vgg16_reducedfc.pth', type=str,
-    help='file path of pretrained model')
-parser.add_argument('--batch_size', default=16, type=int,
-    help='batch size for training')
-parser.add_argument('--num_workers', default=4, type=int,
-    help='number of workers used in data loading')
-parser.add_argument('--cuda', default=True, type=str2bool,
-    help='use CUDA to train model')
-parser.add_argument('--lr', default=1e-3, type=float,
-    help='initial learning rate')
-parser.add_argument('--momentum', default=0.9, type=float,
-    help='momentum value for optimize')
-parser.add_argument('--weight_decay', default=5e-4, type=float,
-    help='weight decay for SGD')
-parser.add_argument('--gamma', default=0.1, type=float,
-    help='gamma update for SGD')
-parser.add_argument('--saving_folder', default='weights', type=str,
-    help='directory for saving weights')
-parser.add_argument('--saving_interval', default=10000, type=int,
-    help='interval of saving model')
+    Log.i('Found {:d} samples'.format(len(dataset)))
 
-args = parser.parse_args()
-
-torch.set_default_tensor_type('torch.FloatTensor')
-if torch.cuda.is_available():
-    if args.cuda:
-        torch.set_default_tensor_type('torch.cuda.FloatTensor')
-    else:
-        print("WARNING: It looks like you have a CUDA device, but aren't " +
-            "using CUDA. \nRun with --cuda for optimal training speed.")
-            
-if not os.path.exists(args.saving_folder):
-    os.mkdir(args.saving_folder)
-    
-def train():
-    dataset = VOCDataset(
-        root=args.dataset_root,
-        sets=[(args.dataset_year, args.dataset_style)],
-        ann_transform=VOCTransform(voc_classes),
-        augment=Augmentation(size=ssd_cfg['min_dim'], mean=voc_mean, complicated=True)
+    backbone = BackboneBase.from_name(backbone_name)(pretrained=True)
+    model = nn.DataParallel(
+        Model(
+            backbone, dataset.num_classes(), pooler_mode=Config.POOLER_MODE,
+            anchor_ratios=Config.ANCHOR_RATIOS, anchor_sizes=Config.ANCHOR_SIZES,
+            rpn_pre_nms_top_n=Config.RPN_PRE_NMS_TOP_N, rpn_post_nms_top_n=Config.RPN_POST_NMS_TOP_N,
+            anchor_smooth_l1_loss_beta=Config.ANCHOR_SMOOTH_L1_LOSS_BETA, proposal_smooth_l1_loss_beta=Config.PROPOSAL_SMOOTH_L1_LOSS_BETA
+        ).cuda()
     )
-    data_loader = data.DataLoader(dataset, args.batch_size,
-        num_workers=args.num_workers, shuffle=True, collate_fn=collate,
-        pin_memory=True)
-    p = os.path.join(args.dataset_root, 'VOC' + args.dataset_year,
-        'ImageSets', 'Main', args.dataset_style + '.txt')
-    print('Loading dataset from {}...'.format(p))
-    
-    ssd_net = build_ssd(phase='train', cfg=ssd_cfg)
-    if args.resume:
-        resume_weights = args.resume
-        print('Resuming training, loading {}...'.format(resume_weights))
-        ssd_net.load_weights(resume_weights)
-    else:
-        vgg_weights = args.pretrained_model
-        print('Starting training, loading pretrained model {}...'.format(vgg_weights))
-        ssd_net.load_vgg_weights(vgg_weights)
-        ssd_net.init_extra_weights()
-        
-    # DataParallel wraps the underlying module, but when saving and loading
-    # we don't want that.
-    net = ssd_net
-    net.train()
-    if args.cuda:
-        net = torch.nn.DataParallel(net)
-        cudnn.benchmark = True
-        net = net.cuda()
-    
-    optimizer = optim.SGD(net.parameters(), lr=args.lr,
-        momentum=args.momentum, weight_decay=args.weight_decay)
-    criterion = MultiBoxLoss(cfg=ssd_cfg, iou_thresh=0.5, neg_pos_ratio=3,
-        cuda=args.cuda)
-    
-    step_index = 0
-    epoch, iter_num_per_epoch = 0, len(dataset) // args.batch_size
-    batch_iterator = iter(data_loader)
-    print('\nUsing the specified args:\n', args, '\n')
-    
-    for it in range(1, ssd_cfg['max_iter'] + 1):
-        if it % iter_num_per_epoch == 0:
-            epoch += 1
-            
-        if it in ssd_cfg['lr_steps']:
-            step_index += 1
-            adjust_lr(optimizer, args.gamma, step_index, args.lr)
-            
-        try:
-            imgs, targets = next(batch_iterator)
-        except StopIteration:
-            batch_iterator = iter(data_loader)
-            imgs, targets = next(batch_iterator)
-            
-        if args.cuda:
-            imgs = imgs.cuda()
-            targets = [ann.cuda() for ann in targets]
-            
-        t0 = time.time()
-        out = net(imgs) # inference
-        
-        optimizer.zero_grad()
-        l_loss, c_loss = criterion(out, targets)
-        
-        loss = l_loss + c_loss
-        loss.backward()
-        
-        optimizer.step()
-        t1 = time.time()
-        
-        ll = l_loss.item()
-        cl = c_loss.item()
-        
-        if it % 10 == 0:
-            print('Epoch: %s || Iter: %s || Loss: %.4f || Timer: %.4f sec.' % (
-                repr(epoch), repr(it), ll + cl, t1 - t0))
-                
-        if it % args.saving_interval == 0 or it == ssd_cfg['max_iter']:
-            print('Saving state, iter:', it)
-            torch.save(ssd_net.state_dict(), args.saving_folder + '/ssd300_' +
-                repr(epoch) + '_' + repr(it) + '.pth')
+    optimizer = optim.SGD(model.parameters(), lr=Config.LEARNING_RATE,
+                          momentum=Config.MOMENTUM, weight_decay=Config.WEIGHT_DECAY)
+    scheduler = WarmUpMultiStepLR(optimizer, milestones=Config.STEP_LR_SIZES, gamma=Config.STEP_LR_GAMMA,
+                                  factor=Config.WARM_UP_FACTOR, num_iters=Config.WARM_UP_NUM_ITERS)
+
+    step = 0
+    time_checkpoint = time.time()
+    losses = deque(maxlen=100)
+    summary_writer = SummaryWriter(os.path.join(path_to_checkpoints_dir, 'summaries'))
+    should_stop = False
+
+    num_steps_to_display = Config.NUM_STEPS_TO_DISPLAY
+    num_steps_to_snapshot = Config.NUM_STEPS_TO_SNAPSHOT
+    num_steps_to_finish = Config.NUM_STEPS_TO_FINISH
+
+    if path_to_resuming_checkpoint is not None:
+        step = model.module.load(path_to_resuming_checkpoint, optimizer, scheduler)
+        Log.i(f'Model has been restored from file: {path_to_resuming_checkpoint}')
+
+    device_count = torch.cuda.device_count()
+    assert Config.BATCH_SIZE % device_count == 0, 'The batch size is not divisible by the device count'
+    Log.i('Start training with {:d} GPUs ({:d} batches per GPU)'.format(torch.cuda.device_count(),
+                                                                        Config.BATCH_SIZE // torch.cuda.device_count()))
+
+    while not should_stop:
+        for _, (_, image_batch, _, bboxes_batch, labels_batch) in enumerate(dataloader):
+            batch_size = image_batch.shape[0]
+            image_batch = image_batch.cuda()
+            bboxes_batch = bboxes_batch.cuda()
+            labels_batch = labels_batch.cuda()
+
+            anchor_objectness_losses, anchor_transformer_losses, proposal_class_losses, proposal_transformer_losses = \
+                model.train().forward(image_batch, bboxes_batch, labels_batch)
+            anchor_objectness_loss = anchor_objectness_losses.mean()
+            anchor_transformer_loss = anchor_transformer_losses.mean()
+            proposal_class_loss = proposal_class_losses.mean()
+            proposal_transformer_loss = proposal_transformer_losses.mean()
+            loss = anchor_objectness_loss + anchor_transformer_loss + proposal_class_loss + proposal_transformer_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            losses.append(loss.item())
+            summary_writer.add_scalar('train/anchor_objectness_loss', anchor_objectness_loss.item(), step)
+            summary_writer.add_scalar('train/anchor_transformer_loss', anchor_transformer_loss.item(), step)
+            summary_writer.add_scalar('train/proposal_class_loss', proposal_class_loss.item(), step)
+            summary_writer.add_scalar('train/proposal_transformer_loss', proposal_transformer_loss.item(), step)
+            summary_writer.add_scalar('train/loss', loss.item(), step)
+            step += 1
+
+            if step == num_steps_to_finish:
+                should_stop = True
+
+            if step % num_steps_to_display == 0:
+                elapsed_time = time.time() - time_checkpoint
+                time_checkpoint = time.time()
+                steps_per_sec = num_steps_to_display / elapsed_time
+                samples_per_sec = batch_size * steps_per_sec
+                eta = (num_steps_to_finish - step) / steps_per_sec / 3600
+                avg_loss = sum(losses) / len(losses)
+                lr = scheduler.get_lr()[0]
+                Log.i(f'[Step {step}] Avg. Loss = {avg_loss:.6f}, Learning Rate = {lr:.8f} ({samples_per_sec:.2f} samples/sec; ETA {eta:.1f} hrs)')
+
+            if step % num_steps_to_snapshot == 0 or should_stop:
+                path_to_checkpoint = model.module.save(path_to_checkpoints_dir, step, optimizer, scheduler)
+                Log.i(f'Model has been saved to {path_to_checkpoint}')
+
+            if should_stop:
+                break
+
+    Log.i('Done')
+
 
 if __name__ == '__main__':
-    train()
+    def main():
+        parser = argparse.ArgumentParser()
+        parser.add_argument('-s', '--dataset', type=str, choices=DatasetBase.OPTIONS, required=True, help='name of dataset')
+        parser.add_argument('-b', '--backbone', type=str, choices=BackboneBase.OPTIONS, required=True, help='name of backbone model')
+        parser.add_argument('-d', '--data_dir', type=str, default='./data', help='path to data directory')
+        parser.add_argument('-o', '--outputs_dir', type=str, default='./outputs', help='path to outputs directory')
+        parser.add_argument('-r', '--resume_checkpoint', type=str, help='path to resuming checkpoint')
+        parser.add_argument('--image_min_side', type=float, help='default: {:g}'.format(Config.IMAGE_MIN_SIDE))
+        parser.add_argument('--image_max_side', type=float, help='default: {:g}'.format(Config.IMAGE_MAX_SIDE))
+        parser.add_argument('--anchor_ratios', type=str, help='default: "{!s}"'.format(Config.ANCHOR_RATIOS))
+        parser.add_argument('--anchor_sizes', type=str, help='default: "{!s}"'.format(Config.ANCHOR_SIZES))
+        parser.add_argument('--pooler_mode', type=str, choices=Pooler.OPTIONS, help='default: {.value:s}'.format(Config.POOLER_MODE))
+        parser.add_argument('--rpn_pre_nms_top_n', type=int, help='default: {:d}'.format(Config.RPN_PRE_NMS_TOP_N))
+        parser.add_argument('--rpn_post_nms_top_n', type=int, help='default: {:d}'.format(Config.RPN_POST_NMS_TOP_N))
+        parser.add_argument('--anchor_smooth_l1_loss_beta', type=float, help='default: {:g}'.format(Config.ANCHOR_SMOOTH_L1_LOSS_BETA))
+        parser.add_argument('--proposal_smooth_l1_loss_beta', type=float, help='default: {:g}'.format(Config.PROPOSAL_SMOOTH_L1_LOSS_BETA))
+        parser.add_argument('--batch_size', type=int, help='default: {:g}'.format(Config.BATCH_SIZE))
+        parser.add_argument('--learning_rate', type=float, help='default: {:g}'.format(Config.LEARNING_RATE))
+        parser.add_argument('--momentum', type=float, help='default: {:g}'.format(Config.MOMENTUM))
+        parser.add_argument('--weight_decay', type=float, help='default: {:g}'.format(Config.WEIGHT_DECAY))
+        parser.add_argument('--step_lr_sizes', type=str, help='default: {!s}'.format(Config.STEP_LR_SIZES))
+        parser.add_argument('--step_lr_gamma', type=float, help='default: {:g}'.format(Config.STEP_LR_GAMMA))
+        parser.add_argument('--warm_up_factor', type=float, help='default: {:g}'.format(Config.WARM_UP_FACTOR))
+        parser.add_argument('--warm_up_num_iters', type=int, help='default: {:d}'.format(Config.WARM_UP_NUM_ITERS))
+        parser.add_argument('--num_steps_to_display', type=int, help='default: {:d}'.format(Config.NUM_STEPS_TO_DISPLAY))
+        parser.add_argument('--num_steps_to_snapshot', type=int, help='default: {:d}'.format(Config.NUM_STEPS_TO_SNAPSHOT))
+        parser.add_argument('--num_steps_to_finish', type=int, help='default: {:d}'.format(Config.NUM_STEPS_TO_FINISH))
+        args = parser.parse_args()
+
+        dataset_name = args.dataset
+        backbone_name = args.backbone
+        path_to_data_dir = args.data_dir
+        path_to_outputs_dir = args.outputs_dir
+        path_to_resuming_checkpoint = args.resume_checkpoint
+
+        path_to_checkpoints_dir = os.path.join(path_to_outputs_dir, 'checkpoints-{:s}-{:s}-{:s}-{:s}'.format(
+            time.strftime('%Y%m%d%H%M%S'), dataset_name, backbone_name, str(uuid.uuid4()).split('-')[0]))
+        os.makedirs(path_to_checkpoints_dir)
+
+        Config.setup(image_min_side=args.image_min_side, image_max_side=args.image_max_side,
+                     anchor_ratios=args.anchor_ratios, anchor_sizes=args.anchor_sizes, pooler_mode=args.pooler_mode,
+                     rpn_pre_nms_top_n=args.rpn_pre_nms_top_n, rpn_post_nms_top_n=args.rpn_post_nms_top_n,
+                     anchor_smooth_l1_loss_beta=args.anchor_smooth_l1_loss_beta, proposal_smooth_l1_loss_beta=args.proposal_smooth_l1_loss_beta,
+                     batch_size=args.batch_size, learning_rate=args.learning_rate, momentum=args.momentum, weight_decay=args.weight_decay,
+                     step_lr_sizes=args.step_lr_sizes, step_lr_gamma=args.step_lr_gamma,
+                     warm_up_factor=args.warm_up_factor, warm_up_num_iters=args.warm_up_num_iters,
+                     num_steps_to_display=args.num_steps_to_display, num_steps_to_snapshot=args.num_steps_to_snapshot, num_steps_to_finish=args.num_steps_to_finish)
+
+        Log.initialize(os.path.join(path_to_checkpoints_dir, 'train.log'))
+        Log.i('Arguments:')
+        for k, v in vars(args).items():
+            Log.i(f'\t{k} = {v}')
+        Log.i(Config.describe())
+
+        _train(dataset_name, backbone_name, path_to_data_dir, path_to_checkpoints_dir, path_to_resuming_checkpoint)
+
+    main()

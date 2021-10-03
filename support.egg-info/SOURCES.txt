@@ -1,0 +1,11 @@
+LICENSE
+README.md
+/home/garaev/repos/easy-faster-rcnn.pytorch/support/src/vision.cpp
+/home/garaev/repos/easy-faster-rcnn.pytorch/support/src/cpu/ROIAlign_cpu.cpp
+/home/garaev/repos/easy-faster-rcnn.pytorch/support/src/cpu/nms_cpu.cpp
+/home/garaev/repos/easy-faster-rcnn.pytorch/support/src/cuda/ROIAlign_cuda.cu
+/home/garaev/repos/easy-faster-rcnn.pytorch/support/src/cuda/nms.cu
+support.egg-info/PKG-INFO
+support.egg-info/SOURCES.txt
+support.egg-info/dependency_links.txt
+support.egg-info/top_level.txt
