@@ -209,7 +209,7 @@ All experiments done with ResNet18 backbone on one 1080ti with batch 20, average
 3. All dynamic pools work rather slowly, since they use a loop in their implementation, so dynamic pools are only beneficial if the RoI align branch is rarely selected. This happens often in DYNAMIC_128x128, so it can be called the best in terms of accuracy to speed. In case you need to get accuracy and speed between RoI pool and RoI align, it is best to use DYNAMIC_128x128.
 
 ## Further exploration
-1. If you figure out how to do dynamic pooling based on matrix operations without a loop, then this will significantly speed up this approach.
+If you figure out how to do dynamic pooling based on matrix operations without a loop, then this will significantly speed up this approach.
 
 ## References
 The code for training is taken from this repository: https://github.com/potterhsu/easy-faster-rcnn.pytorch.git
