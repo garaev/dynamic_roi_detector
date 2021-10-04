@@ -14,9 +14,12 @@ class Pooler(object):
         POOLING = 'pooling'
         ALIGN = 'align'
         DYNAMIC = 'dynamic'
-        ALIGN_2 = 'align_2'
+        DYNAMIC_REVERSE = 'dynamic_reverse'
+        DYNAMIC_128x128 = 'dynamic_128x128'
+        DYNAMIC_256x256 = 'dynamic_256x256'
+        DYNAMIC_512x512 = 'dynamic_512x512'
 
-    OPTIONS = ['pooling', 'align', 'dynamic', 'align_2']
+    OPTIONS = ['pooling', 'align', 'dynamic', 'dynamic_reverse', 'dynamic_128x128', 'dynamic_256x256', 'dynamic_512x512']
 
     @staticmethod
     def apply(features: Tensor, proposal_bboxes: Tensor, proposal_batch_indices: Tensor, mode: Mode) -> Tensor:
@@ -45,18 +48,38 @@ class Pooler(object):
                 ).view(256,14,14)
                 pool.append(x)
             pool = torch.stack(pool, dim=0)
-        elif mode == Pooler.Mode.DYNAMIC:
+        elif mode in [Pooler.Mode.DYNAMIC, Pooler.Mode.DYNAMIC_REVERSE, Pooler.Mode.DYNAMIC_128x128, \
+                      Pooler.Mode.DYNAMIC_256x256, Pooler.Mode.DYNAMIC_512x512]:
             pool = []
-            avg = [0,0]
-            counts = [0,0]
+            if mode in [Pooler.Mode.DYNAMIC, Pooler.Mode.DYNAMIC_REVERSE]:
+                sizes_sum = [0,0]
+                counts = [0,0]
+            # calculate it once for speed up inference
+            _128x128 = 128*128
+            _256x256 = 256*256
+            _512x512 = 512*512
             for (proposal_bbox, proposal_batch_index) in zip(proposal_bboxes, proposal_batch_indices):
-                #print(proposal_bbox[2], proposal_bbox[3])
-                avg[0] += proposal_bbox[2]
-                counts[0] += 1
-                avg[1] += proposal_bbox[3]
-                counts[1] += 1
-                if proposal_bbox[2]*proposal_bbox[3] > 512*512: #(avg[0]/counts[0])*(avg[1]/counts[1])
-                #if random.choice([0,1]):
+                bbox_square = proposal_bbox[2] * proposal_bbox[3]
+                # iteratively calculating average online for maximize speed of forward pass
+                if mode in [Pooler.Mode.DYNAMIC, Pooler.Mode.DYNAMIC_REVERSE]:
+                    sizes_sum[0] += proposal_bbox[2]
+                    counts[0] += 1
+                    sizes_sum[1] += proposal_bbox[3]
+                    counts[1] += 1
+                    avg_square = (sizes_sum[0] / counts[0]) * (sizes_sum[1] / counts[1])
+                    if mode == Pooler.Mode.DYNAMIC:
+                        # proposal_bbox shape is x_shift, y_shift, weight, height
+                        condition = bbox_square > avg_square
+                    elif mode == Pooler.Mode.DYNAMIC_REVERSE:
+                        condition = bbox_square < avg_square
+                elif mode == Pooler.Mode.DYNAMIC_128x128:
+                    condition = bbox_square > _128x128
+                elif mode == Pooler.Mode.DYNAMIC_256x256:
+                    condition = bbox_square > _256x256
+                elif mode == Pooler.Mode.DYNAMIC_512x512:
+                    condition = bbox_square > _512x512
+
+                if condition:
                     start_x = max(min(round(proposal_bbox[0].item() * scale), feature_map_width - 1),
                                   0)  # [0, feature_map_width)
                     start_y = max(min(round(proposal_bbox[1].item() * scale), feature_map_height - 1),
@@ -68,28 +91,14 @@ class Pooler(object):
                     roi_feature_map = features[proposal_batch_index, :, start_y:end_y, start_x:end_x]
                     out = F.adaptive_max_pool2d(input=roi_feature_map, output_size=output_size)
                 else:
-                    a = features[proposal_batch_index].view(1, 256, features.shape[2], features.shape[3])
-                    b = torch.stack(
+                    features_cur_iter = features[proposal_batch_index].view(1, 256, features.shape[2], features.shape[3])
+                    proposal_bbox_tensor = torch.stack(
                         [torch.Tensor([0, proposal_bbox[0], proposal_bbox[1], proposal_bbox[2], proposal_bbox[3]])],
                         dim=0).cuda()
                     out = ROIAlign(output_size, spatial_scale=scale, sampling_ratio=0)(
-                        a,
-                        b
+                        features_cur_iter,
+                        proposal_bbox_tensor
                         ).view(256, 14, 14)
-                pool.append(out)
-            #print((avg[0]/counts[0]), (avg[1]/counts[1]))
-            pool = torch.stack(pool, dim=0)
-        elif mode == Pooler.Mode.ALIGN_2:
-            pool = []
-            for (proposal_bbox, proposal_batch_index) in zip(proposal_bboxes, proposal_batch_indices):
-                a = features[proposal_batch_index].view(1, 256, features.shape[2], features.shape[3])
-                b = torch.stack(
-                    [torch.Tensor([0, proposal_bbox[0], proposal_bbox[1], proposal_bbox[2], proposal_bbox[3]])],
-                    dim=0).cuda()
-                out = ROIAlign(output_size, spatial_scale=scale, sampling_ratio=0)(
-                    a,
-                    b
-                    ).view(256, 14, 14)
                 pool.append(out)
             pool = torch.stack(pool, dim=0)
         else:

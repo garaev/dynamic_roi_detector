@@ -6,7 +6,7 @@ from tqdm import tqdm
 
 from dataset.base import Base as DatasetBase
 from model import Model
-
+import time
 
 class Evaluator(object):
     def __init__(self, dataset: DatasetBase, path_to_data_dir: str, path_to_results_dir: str):
@@ -18,15 +18,19 @@ class Evaluator(object):
 
     def evaluate(self, model: Model) -> Tuple[float, str]:
         all_image_ids, all_detection_bboxes, all_detection_classes, all_detection_probs = [], [], [], []
-
+        time_sum = 0
+        num_of_samples = 4952
         with torch.no_grad():
             for _, (image_id_batch, image_batch, scale_batch, _, _) in enumerate(tqdm(self._dataloader)):
                 image_batch = image_batch.cuda()
                 assert image_batch.shape[0] == 1, 'do not use batch size more than 1 on evaluation'
 
+                t_start = time.time()
                 detection_bboxes, detection_classes, detection_probs, detection_batch_indices = \
                     model.eval().forward(image_batch)
-
+                elapsed_time = time.time() - t_start
+                #print('Elapsed time: %.2f [s / %d evals]' % (elapsed_time, 4952))
+                time_sum += elapsed_time
                 scale_batch = scale_batch[detection_batch_indices].unsqueeze(dim=-1).expand_as(detection_bboxes).to(device=detection_bboxes.device)
                 detection_bboxes = detection_bboxes / scale_batch
 
@@ -42,4 +46,5 @@ class Evaluator(object):
                 all_image_ids.extend([image_id_batch[i] for i in detection_batch_indices])
 
         mean_ap, detail = self._dataset.evaluate(self._path_to_results_dir, all_image_ids, all_detection_bboxes, all_detection_classes, all_detection_probs)
+        print(time_sum/num_of_samples)
         return mean_ap, detail
